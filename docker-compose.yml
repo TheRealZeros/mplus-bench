@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  bench:
+    build: .
+    image: mplus-bench:0.1
+    container_name: mplus-bench
+    environment:
+      - HF_HOME=/workspace/.cache/huggingface
+      - TRANSFORMERS_CACHE=/workspace/.cache/huggingface/hub
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
+    volumes:
+      - ./scripts:/workspace/scripts
+      - ./results:/workspace/results
+      - ./data:/workspace/data
+      - ./cache:/workspace/.cache
+    working_dir: /workspace
+    ipc: host
+    stdin_open: true
+    tty: true

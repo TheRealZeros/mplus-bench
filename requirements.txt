@@ -1,0 +1,10 @@
+transformers>=4.43
+accelerate
+datasets
+evaluate
+sentencepiece
+bitsandbytes
+lm-eval==0.4.2
+numpy
+scipy
+tqdm
