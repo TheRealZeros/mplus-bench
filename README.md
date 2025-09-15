@@ -15,6 +15,12 @@ This repo reproduces two benchmarks from the M+ paper:
 ```bash
 docker compose build
 
-docker load -i mplus-bench_0.1.tar
+docker load -i mplus-bench-cu121.tar
 
 docker compose run --rm bench bash
+
+docker run --gpus all -it --rm \
+  -v $(pwd):/workspace \
+  -e HF_TOKEN=$HF_TOKEN \
+  mplus-bench:cu121 \
+  bash

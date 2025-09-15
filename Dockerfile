@@ -18,11 +18,15 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1 && \
 RUN pip install --no-cache-dir \
     torch==2.1.2 --extra-index-url https://download.pytorch.org/whl/cu121 && \
     pip install --no-cache-dir \
-      "transformers==4.56.1" "tokenizers==0.22.0" \
-      "peft==0.12.0" "accelerate==0.33.0" \
-      "sentencepiece==0.1.99" "datasets==2.20.0" "evaluate==0.4.2" \
-      "numpy<2" "scipy" "tqdm" "psutil" \
-      "bitsandbytes==0.43.1" "hf_transfer==0.1.6"
+    "transformers==4.40.0" \
+    "tokenizers==0.19.1" \
+    "peft==0.10.0" \
+    "accelerate==0.29.3" \
+    "sentencepiece==0.1.99" \
+    "datasets==2.20.0" \
+    "evaluate==0.4.2" \
+    "numpy<2" "scipy" "tqdm" "psutil" \
+    "bitsandbytes==0.43.1" "hf_transfer==0.1.6"
 
 # Create workspace and mount points
 WORKDIR /workspace
