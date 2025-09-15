@@ -1,26 +1,30 @@
-version: "3.9"
-
 services:
   bench:
     build:
       context: .
       dockerfile: Dockerfile
-    # remove the line: image: your-image:latest
-    runtime: nvidia
+    image: mplus-bench:cu121
+    container_name: mplus-bench
+    shm_size: "16gb"           # avoid OOM on tokenization
+    environment:
+      - HF_HOME=/workspace/hf_cache
+      - HUGGINGFACE_HUB_CACHE=/workspace/hf_cache
+      - HF_DATASETS_CACHE=/workspace/hf_cache/datasets
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - TRANSFORMERS_VERBOSITY=info
+      # Picked up at runtime from your host shell or .env
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      # map to a drive with space; change the left side to a big disk path
+      - ./hf_cache:/workspace/hf_cache
+      - ./logs:/workspace/logs
+      - ./results:/workspace/results
+      - ./data:/workspace/data
+      - ./scripts:/workspace/scripts
+      - ./ext_mplus:/workspace/ext_mplus
     deploy:
       resources:
         reservations:
           devices:
             - capabilities: [gpu]
-    environment:
-      - HF_HOME=/workspace/cache/huggingface
-      - HUGGINGFACE_HUB_CACHE=/workspace/cache/huggingface
-      - HF_DATASETS_CACHE=/workspace/cache/huggingface/datasets
-    volumes:
-      - ./logs:/workspace/logs
-      - ./results:/workspace/results
-      - ./cache/huggingface:/workspace/cache/huggingface
-    shm_size: "8g"
-    tty: true
-    stdin_open: true
-    working_dir: /workspace
+    runtime: nvidia

@@ -1,51 +1,51 @@
+# CUDA runtime only (no toolkit). Works on 3080/4090.
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    HF_HOME=/workspace/.cache/huggingface \
-    TRANSFORMERS_CACHE=/workspace/.cache/huggingface/hub \
-    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+ENV DEBIAN_FRONTEND=noninteractive
 
-WORKDIR /workspace
-
-# System deps: python, git, build tools, tini
+# Base OS deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv python3-dev \
-    git build-essential \
-    tini ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/*
+    git curl wget ca-certificates python3 python3-pip python3-venv build-essential \
+ && rm -rf /var/lib/apt/lists/*
 
-# Ensure `python` points to python3
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+# Make python/pip the defaults
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1 && \
+    update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
 
-# Install CUDA 12.1 wheels of torch separately (Option A)
-RUN pip install --upgrade pip && \
-    pip install --index-url https://download.pytorch.org/whl/cu121 \
-        torch torchvision torchaudio
+# ---- PYTHON PACKAGES ----
+# Pins that are compatible (no flash-attn, NumPy < 2 to avoid extension ABI issues)
+# torch 2.1.2 + cu121, transformers 4.56.1, tokenizers 0.20.x, bitsandbytes 0.43.1
+RUN pip install --no-cache-dir \
+    torch==2.1.2 --extra-index-url https://download.pytorch.org/whl/cu121 && \
+    pip install --no-cache-dir \
+      "transformers==4.56.1" "tokenizers==0.22.0" \
+      "peft==0.12.0" "accelerate==0.33.0" \
+      "sentencepiece==0.1.99" "datasets==2.20.0" "evaluate==0.4.2" \
+      "numpy<2" "scipy" "tqdm" "psutil" \
+      "bitsandbytes==0.43.1" "hf_transfer==0.1.6"
 
-# Copy requirements and install (no torch here)
-COPY requirements.txt /workspace/requirements.txt
-RUN pip install -r /workspace/requirements.txt
+# Create workspace and mount points
+WORKDIR /workspace
+RUN mkdir -p /workspace/scripts /workspace/results /workspace/logs /workspace/ext_mplus /workspace/hf_cache /workspace/data
 
-# Cache locations inside the container (vetted by HF)
-ENV HF_HOME=/workspace/cache/huggingface
-ENV HUGGINGFACE_HUB_CACHE=/workspace/cache/huggingface
-ENV HF_DATASETS_CACHE=/workspace/cache/huggingface/datasets
-# optional verbosity for clearer warnings
-ENV TRANSFORMERS_VERBOSITY=info
 
-# Make sure directories exist
-RUN mkdir -p /workspace/cache/huggingface /workspace/logs /workspace/results
+# Copy your scripts (only what we need)
+# If you keep them beside this Dockerfile:
+#   - run_knowledge_retention.py
+#   - run_longbench.py (optional)
+#   - sanity_check.py (optional)
 
-# Create cache/results dirs (can be mounted)
-RUN mkdir -p /workspace/scripts /workspace/data /workspace/results /workspace/.cache
+# Pull M+ helper modules (straight from the repo via curl)
+RUN curl -L -o /workspace/ext_mplus/modeling_mplus.py https://raw.githubusercontent.com/wangyu-ustc/MemoryLLM/main/modeling_mplus.py && \
+    curl -L -o /workspace/ext_mplus/configuration_memoryllm.py https://raw.githubusercontent.com/wangyu-ustc/MemoryLLM/main/configuration_memoryllm.py
 
-# Copy scripts (bind-mounts in compose will override during dev)
-COPY scripts/ /workspace/scripts/
+# Keep stdout unbuffered for logs
+ENV PYTHONUNBUFFERED=1
+# Hugging Face cache inside container (will be volume-mapped)
+ENV HF_HOME=/workspace/hf_cache \
+    HUGGINGFACE_HUB_CACHE=/workspace/hf_cache \
+    HF_DATASETS_CACHE=/workspace/hf_cache/datasets \
+    HF_HUB_ENABLE_HF_TRANSFER=1
 
-# Default entry via tini into bash
-ENTRYPOINT ["/usr/bin/tini","--"]
-CMD ["bash"]
+# Default command is bash; compose will override
+CMD ["/bin/bash"]
