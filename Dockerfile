@@ -30,6 +30,16 @@ RUN pip install --upgrade pip && \
 COPY requirements.txt /workspace/requirements.txt
 RUN pip install -r /workspace/requirements.txt
 
+# Cache locations inside the container (vetted by HF)
+ENV HF_HOME=/workspace/cache/huggingface
+ENV HUGGINGFACE_HUB_CACHE=/workspace/cache/huggingface
+ENV HF_DATASETS_CACHE=/workspace/cache/huggingface/datasets
+# optional verbosity for clearer warnings
+ENV TRANSFORMERS_VERBOSITY=info
+
+# Make sure directories exist
+RUN mkdir -p /workspace/cache/huggingface /workspace/logs /workspace/results
+
 # Create cache/results dirs (can be mounted)
 RUN mkdir -p /workspace/scripts /workspace/data /workspace/results /workspace/.cache
 

@@ -6,7 +6,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import torch
@@ -70,14 +70,29 @@ class Example:
     answers: List[str]
 
 
-def load_examples(dataset: str, n_eval: int, seed: int) -> List[Example]:
+def load_examples(
+    dataset: str,
+    n_eval: int,
+    seed: int,
+    shuffle: bool = True,
+    ids_file: Optional[str] = None,
+) -> List[Example]:
     rng = random.Random(seed)
     if dataset == "squad":
         ds = load_dataset("squad")
         val = ds["validation"]
         # short answers <= 3 tokens
         items = []
-        for ex in val:
+        allow_idx = None
+        if ids_file:
+            try:
+                with open(ids_file, "r", encoding="utf-8") as f:
+                    allow_idx = set(int(line.strip()) for line in f if line.strip())
+            except Exception:
+                allow_idx = None
+        for i, ex in enumerate(val):
+            if allow_idx is not None and i not in allow_idx:
+                continue
             ans = ex["answers"]["text"]
             if not ans:
                 continue
@@ -85,13 +100,23 @@ def load_examples(dataset: str, n_eval: int, seed: int) -> List[Example]:
                 items.append(
                     Example(context=ex["context"], question=ex["question"], answers=ans)
                 )
-        rng.shuffle(items)
+        if shuffle:
+            rng.shuffle(items)
         return items[:n_eval]
     elif dataset == "nq":
         # natural_questions validation; keep short answers <= 4 tokens
         ds = load_dataset("natural_questions", split="validation")
         items = []
-        for ex in ds:
+        allow_idx = None
+        if ids_file:
+            try:
+                with open(ids_file, "r", encoding="utf-8") as f:
+                    allow_idx = set(int(line.strip()) for line in f if line.strip())
+            except Exception:
+                allow_idx = None
+        for i, ex in enumerate(ds):
+            if allow_idx is not None and i not in allow_idx:
+                continue
             # Some variants store answers differently; try a few common fields
             answers = []
             if "answers" in ex and isinstance(ex["answers"], dict) and ex["answers"].get("text"):
@@ -108,14 +133,28 @@ def load_examples(dataset: str, n_eval: int, seed: int) -> List[Example]:
                 question = ex.get("question_text") or ex.get("question", "")
                 if context and question:
                     items.append(Example(context=context, question=question, answers=answers))
-        rng.shuffle(items)
+        if shuffle:
+            rng.shuffle(items)
         return items[:n_eval]
     else:
         raise ValueError("dataset must be 'squad' or 'nq'")
 
 
-def build_distractor_bank(tokenizer, target_tokens_per_passage=(300, 500), max_bank=5000) -> List[str]:
-    ds = load_dataset("squad", split="train")
+def build_distractor_bank(
+    tokenizer,
+    source: str = "squad_train",
+    target_tokens_per_passage: Tuple[int, int] = (300, 500),
+    max_bank: int = 5000,
+) -> List[str]:
+    """Build a bank of distractor passages.
+
+    This uses token-level chunking to approximate fixed-size distractors.
+    """
+    if source == "squad_train":
+        ds = load_dataset("squad", split="train")
+        text_field = "context"
+    else:
+        raise ValueError("Unsupported distractor source; use 'squad_train'.")
     passages = []
     low, high = target_tokens_per_passage
     for ex in ds:
@@ -138,60 +177,114 @@ def build_distractor_bank(tokenizer, target_tokens_per_passage=(300, 500), max_b
                     return passages
     return passages
 
-
-def build_messages(context: str, distractors: List[str], question: str, system_prompt: str) -> List[Dict[str, str]]:
-    user_content = (
-        f"Context:\n{context}\n\n"
-        f"Additional Passages:\n{('\n\n'.join(distractors)).strip()}\n\n"
-        f"Question: {question}\nAnswer:"
-    )
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": user_content})
-    return messages
-
-
-def build_prompt(
+def build_prompt_ids_plain(
     tokenizer,
     context: str,
     distractors: List[str],
     question: str,
     system_prompt: str,
-    prefer_chat_template: bool = True,
-) -> str:
-    # Prefer model-native chat template if available
-    if prefer_chat_template and hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
-        messages = build_messages(context, distractors, question, system_prompt)
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    budget_tokens: int,
+    window_tokens: int,
+) -> Tuple[List[int], int]:
+    """Build prompt at token level with exact budgeting and windowing.
 
-    # Fallback: plain prompt
-    prompt = (
-        (system_prompt + "\n\n" if system_prompt else "")
-        + f"Context:\n{context}\n\n"
-        + f"Additional Passages:\n{('\n\n'.join(distractors)).strip()}\n\n"
-        + f"Question: {question}\nAnswer:"
-    )
-    return prompt
+    Returns (prompt_ids, actual_distance_tokens_kept).
+    """
+    # Prefix: optional system prompt (plain, not chat template)
+    prefix = (system_prompt + "\n\n") if system_prompt else ""
+    ctx_prefix = "Context:\n"
+    after_ctx = "\n\nAdditional Passages:\n"
+    q_prefix = "\n\nQuestion: "
+    a_prefix = "\nAnswer:"
+
+    ids_prefix = tokenizer.encode(prefix + ctx_prefix, add_special_tokens=False)
+    ids_ctx = tokenizer.encode(context, add_special_tokens=False)
+    ids_after_ctx = tokenizer.encode(after_ctx, add_special_tokens=False)
+    ids_q_prefix = tokenizer.encode(q_prefix, add_special_tokens=False)
+    ids_question = tokenizer.encode(question, add_special_tokens=False)
+    ids_a_prefix = tokenizer.encode(a_prefix, add_special_tokens=False)
+
+    # Build distractor region to exact budget
+    sep_ids = tokenizer.encode("\n\n", add_special_tokens=False)
+    dist_ids: List[int] = []
+    first = True
+    for d in distractors:
+        d_ids = tokenizer.encode(d, add_special_tokens=False)
+        # add separator between passages
+        if not first:
+            if len(dist_ids) + len(sep_ids) > budget_tokens:
+                break
+            dist_ids.extend(sep_ids)
+        first = False
+        # add passage with truncation to fit budget
+        remaining = budget_tokens - len(dist_ids)
+        if remaining <= 0:
+            break
+        if len(d_ids) <= remaining:
+            dist_ids.extend(d_ids)
+        else:
+            dist_ids.extend(d_ids[:remaining])
+            break
+
+    # Assemble full token sequence
+    ids_before_dist = ids_prefix + ids_ctx + ids_after_ctx
+    ids_suffix = ids_q_prefix + ids_question + ids_a_prefix
+    total_ids = ids_before_dist + dist_ids + ids_suffix
+
+    # Enforce window by truncating from the front
+    total_len = len(total_ids)
+    if total_len > window_tokens:
+        offset = total_len - window_tokens
+        total_ids = total_ids[offset:]
+    else:
+        offset = 0
+
+    # Compute how many distractor tokens survived after clamping
+    Lctx = len(ids_before_dist)
+    Ldist = len(dist_ids)
+    Lsuffix = len(ids_suffix)
+    start = offset
+    end = offset + len(total_ids)
+    # Overlap of [Lctx, Lctx+Ldist) with [start, end)
+    left = max(Lctx, start)
+    right = min(Lctx + Ldist, end)
+    actual = max(0, right - left)
+
+    return total_ids, int(actual)
 
 
 def run_generation(model, tokenizer, prompt: str, max_new_tokens=16) -> str:
+    # ensure we have a pad token for generate()
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
     if torch.cuda.is_available():
         inputs = {k: v.cuda() for k, v in inputs.items()}
+    input_len = inputs["input_ids"].shape[1]
+
     with torch.no_grad():
         out = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
+            min_new_tokens=1,         # <- ensure at least 1 token is produced
             do_sample=False,
             temperature=0.0,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            # don't force eos_token_id here; some chat models stop instantly
         )
-    text = tokenizer.decode(out[0], skip_special_tokens=True)
-    # Return only the answer portion after last 'Answer:' if present
+
+    # decode ONLY the continuation, not the prompt
+    gen_ids = out[0][input_len:]
+    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+    # if the model echoed "Answer:", trim safely
     if "Answer:" in text:
         text = text.split("Answer:")[-1]
+
+    # return a terse span (first line)
     return text.strip().split("\n")[0].strip()
+
 
 
 def eval_budget(
@@ -203,6 +296,7 @@ def eval_budget(
     window_tokens: int,
     system_prompt: str,
     prefer_chat_template: bool,
+    max_new_tokens: int,
 ) -> Tuple[float, float, int]:
     rng = random.Random(0)
     ems, f1s = [], []
@@ -229,28 +323,45 @@ def eval_budget(
             chosen.append(p)
             tok_count += len(ids)
 
-        # Build prompt and clamp to total window length
-        prompt = build_prompt(
-            tokenizer,
-            ex.context,
-            chosen,
-            ex.question,
-            system_prompt,
-            prefer_chat_template=prefer_chat_template,
-        )
-        ids = tokenizer.encode(prompt, add_special_tokens=False)
-        if len(ids) > window_tokens:
-            # Truncate from the front of the prompt but preserve the question tail
-            ids = ids[-window_tokens:]
-            prompt = tokenizer.decode(ids)
-        # Distance is tokens between gold context end and question start approximately = tok_count (after clamp)
-        # Recompute actual inserted tokens by tokenizing distractor-only section within the prompt, approximate
-        actual = sum(len(tokenizer.encode(d, add_special_tokens=False)) for d in chosen)
-        if actual > window_tokens:
-            actual = window_tokens
-        actual_distance_tokens.append(min(actual, budget_tokens))
+        # Build prompt token-precisely when not using chat_template
+        if not prefer_chat_template:
+            prompt_ids, actual = build_prompt_ids_plain(
+                tokenizer,
+                ex.context,
+                chosen,
+                ex.question,
+                system_prompt,
+                budget_tokens,
+                window_tokens,
+            )
+            prompt = tokenizer.decode(prompt_ids)
+            actual_distance_tokens.append(actual)
+        else:
+            # Fallback to chat template (approximate accounting)
+            # Build plain strings, then clamp to window by tokens
+            chosen_text = ("\n\n".join(chosen)).strip()
+            user_content = (
+                f"Context:\n{ex.context}\n\n"
+                + "Additional Passages:\n" + chosen_text + "\n\n"
+                + f"Question: {ex.question}\nAnswer:"
+            )
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": user_content})
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            ids = tokenizer.encode(prompt, add_special_tokens=False)
+            if len(ids) > window_tokens:
+                ids = ids[-window_tokens:]
+                prompt = tokenizer.decode(ids)
+            # Approximate actual = min(budget_tokens, window_tokens)
+            actual_distance_tokens.append(min(budget_tokens, window_tokens))
 
-        pred = run_generation(model, tokenizer, prompt)
+        pred = run_generation(model, tokenizer, prompt, max_new_tokens=max_new_tokens)
+        if budget_tokens == 0 and len(ems) < 3:
+            print("\nQ:", ex.question)
+            print("Gold:", ex.answers[:3])
+            print("Pred:", pred if pred else "<EMPTY>")
         # Score vs any gold answer
         em = max(exact_match(pred, a) for a in ex.answers)
         f1 = max(f1_score(pred, a) for a in ex.answers)
@@ -269,6 +380,7 @@ def main():
     parser.add_argument("--window", type=int, default=16000)
     parser.add_argument("--budgets", type=str, default="0,2000,8000,16000")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max_new_tokens", type=int, default=16)
     parser.add_argument(
         "--system_prompt",
         type=str,
@@ -283,7 +395,28 @@ def main():
         action="store_true",
         help="Disable using tokenizer.chat_template even if available",
     )
+    parser.add_argument(
+        "--distractor_source",
+        type=str,
+        default="squad_train",
+        choices=["squad_train"],
+        help="Source corpus for distractor passages",
+    )
+    parser.add_argument(
+        "--distractor_chunk_min",
+        type=int,
+        default=300,
+        help="Min tokens per distractor chunk",
+    )
+    parser.add_argument(
+        "--distractor_chunk_max",
+        type=int,
+        default=500,
+        help="Max tokens per distractor chunk",
+    )
     parser.add_argument("--out", type=str, required=True)
+    parser.add_argument("--no_shuffle", action="store_true", help="Do not shuffle; take first n_eval after optional ID filtering")
+    parser.add_argument("--ids_file", type=str, default=None, help="Optional text file with one validation index per line to include (after GPT-4o-mini filtering)")
     # M+ specific options
     parser.add_argument("--use_mplus", action="store_true", help="Force loading with modeling_mplus.MPlus if available")
     parser.add_argument("--attn_impl", type=str, default="eager", choices=["eager", "flash_attention_2"], help="Attention impl for MPlus")
@@ -344,8 +477,18 @@ def main():
         if torch.cuda.is_available() and args.quant == "none":
             model = model.cuda()
 
-    examples = load_examples(args.dataset, args.n_eval, args.seed)
-    distractor_bank = build_distractor_bank(tokenizer)
+    examples = load_examples(
+        args.dataset,
+        args.n_eval,
+        args.seed,
+        shuffle=not args.no_shuffle,
+        ids_file=args.ids_file,
+    )
+    distractor_bank = build_distractor_bank(
+        tokenizer,
+        source=args.distractor_source,
+        target_tokens_per_passage=(args.distractor_chunk_min, args.distractor_chunk_max),
+    )
 
     budgets = [int(x) for x in args.budgets.split(",") if x.strip()]
 
@@ -363,6 +506,7 @@ def main():
                 args.window,
                 args.system_prompt,
                 prefer_chat_template=not args.no_chat_template,
+                max_new_tokens=args.max_new_tokens,
             )
             writer.writerow({"distance_tokens": actual, "EM": em, "F1": f1})
             f.flush()

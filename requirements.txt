@@ -8,3 +8,5 @@ lm-eval==0.4.2
 numpy
 scipy
 tqdm
+hf_transfer
+psutil

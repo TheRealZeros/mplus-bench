@@ -15,6 +15,6 @@ This repo reproduces two benchmarks from the M+ paper:
 ```bash
 docker compose build
 
-### Copy to another, then load:
-
 docker load -i mplus-bench_0.1.tar
+
+docker compose run --rm bench bash
